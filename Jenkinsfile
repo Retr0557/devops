@@ -1,100 +1,140 @@
+// Jenkinsfile - Declarative pipeline
 pipeline {
-  agent any
-
+  agent { label 'docker' } // change label to your agent that has Docker
   environment {
-    IMAGE_NAME = "hyperserve-svc"
-    IMAGE_TAG  = "3"
-    IMAGE_FULL = "${env.IMAGE_NAME}:${env.IMAGE_TAG}"
-    CONTAINER_NAME = "hyperserve-svc-3"
-    HOST_PORT = "12208"
-    CONTAINER_PORT = "12208"
+    IMAGE_NAME = 'hyperserve-svc'
+    IMAGE_TAG  = '3'
+    FULL_IMAGE = "${env.IMAGE_NAME}:${env.IMAGE_TAG}"
+    CONTAINER_NAME = 'hyperserve-svc'
+    HOST_PORT = '12208'
+    CONTAINER_PORT = '12208'
+    // Optional: set registry creds/env if you push images
   }
-
+  options {
+    // Keep build logs for 30 days, limit concurrent builds, etc.
+    timestamps()
+    buildDiscarder(logRotator(daysToKeepStr: '30'))
+  }
   stages {
-    stage('Pre-check Docker') {
-      steps {
-        script {
-          echo "Checking Docker availability..."
-          // fail the pipeline with clear message if docker isn't available or returns non-zero
-          def rc = sh(script: 'docker version --format "{{.Server.Version}}" > /dev/null 2>&1 || echo $? ', returnStdout: true).trim()
-          if (rc != "") {
-            // If rc contains a number it may be from echo $? fallback; detect docker failure by trying docker ps
-            def ok = sh(script: 'docker ps > /dev/null 2>&1; echo $?', returnStdout: true).trim()
-            if (ok != '0') {
-              error("""Docker does not seem to be available on the agent.
-Check that Docker is installed and the Jenkins agent user has permission to run Docker.
-Command 'docker ps' failed with exit code ${ok}.""")
-            }
-          }
-          echo "Docker is available."
-        }
-      }
-    }
-
     stage('Checkout') {
       steps {
         checkout scm
       }
     }
 
-    stage('Build image') {
+    stage('Pre-check Docker') {
       steps {
-        echo "Building Docker image ${IMAGE_FULL}..."
-        sh """
-          # remove intermediate image with same tag if exists (optional)
-          docker build -t ${IMAGE_FULL} .
-        """
-      }
-    }
-
-    stage('Stop previous container (if any)') {
-      steps {
-        echo "Stopping and removing any existing container named ${CONTAINER_NAME}..."
-        sh """
-          if docker ps -a --format '{{.Names}}' | grep -x ${CONTAINER_NAME} > /dev/null 2>&1; then
-            docker rm -f ${CONTAINER_NAME} || true
-          fi
-        """
-      }
-    }
-
-    stage('Run container') {
-      steps {
-        echo "Starting container ${CONTAINER_NAME} mapping host ${HOST_PORT} -> container ${CONTAINER_PORT}..."
-        sh """
-          docker run -d --rm --name ${CONTAINER_NAME} -p ${HOST_PORT}:${CONTAINER_PORT} ${IMAGE_FULL}
-        """
-      }
-    }
-
-    stage('Smoke test') {
-      steps {
-        echo "Waiting for service to respond on http://localhost:${HOST_PORT} ..."
-        // small loop to try curl a few times
-        sh '''
-          n=0
-          until [ $n -ge 10 ]
-          do
-            if curl -fsS --max-time 2 http://localhost:${HOST_PORT}/ >/dev/null 2>&1; then
-              echo "Service responded"
-              exit 0
+        script {
+          // Fail if Docker CLI or daemon not available
+          sh '''
+            echo "==> Checking docker CLI availability..."
+            if ! command -v docker >/dev/null 2>&1; then
+              echo "ERROR: docker CLI not found on PATH. Aborting."
+              exit 2
             fi
-            n=$((n+1))
-            sleep 1
-          done
-          echo "Service did not respond within timeout"
-          exit 2
-        '''
+
+            echo "==> Checking Docker daemon (docker info)..."
+            if ! docker info >/dev/null 2>&1; then
+              echo "ERROR: Docker daemon is not reachable or permission denied. Aborting."
+              echo "Run this agent with Docker installed and the Jenkins user in 'docker' group or with socket access."
+              exit 3
+            fi
+
+            echo "Docker is available and reachable."
+            docker --version
+            docker info --format '{{json .SecurityOptions}}' || true
+          '''
+        }
       }
     }
-  }
+
+    stage('Build Image') {
+      steps {
+        script {
+          // Build the docker image
+          sh '''
+            set -e
+            echo "Building Docker image ${FULL_IMAGE}..."
+            docker build -t ${FULL_IMAGE} .
+            echo "Image built: ${FULL_IMAGE}"
+            docker images --format "table {{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.Size}}"
+          '''
+        }
+      }
+    }
+
+    stage('Run Container') {
+      steps {
+        script {
+          sh '''
+            set -e
+            echo "Stopping any existing container named ${CONTAINER_NAME}..."
+            if docker ps -a --format '{{.Names}}' | grep -w ${CONTAINER_NAME} >/dev/null 2>&1; then
+              docker rm -f ${CONTAINER_NAME} || true
+              echo "Removed previous container ${CONTAINER_NAME}."
+            else
+              echo "No existing container named ${CONTAINER_NAME}."
+            fi
+
+            echo "Starting container ${CONTAINER_NAME} mapping host ${HOST_PORT} -> container ${CONTAINER_PORT}..."
+            docker run -d --name ${CONTAINER_NAME} -p ${HOST_PORT}:${CONTAINER_PORT} ${FULL_IMAGE}
+
+            # Give container a couple of seconds to start
+            sleep 3
+            echo "Container started; container id:"
+            docker ps --filter name=${CONTAINER_NAME} --format '{{.ID}}\t{{.Image}}\t{{.Ports}}'
+          '''
+        }
+      }
+    }
+
+    stage('Verify Listening & Healthcheck') {
+      steps {
+        script {
+          sh '''
+            set -e
+            echo "Collecting docker ps output..."
+            docker ps -a > docker-ps.txt || true
+            echo "Collecting netstat/ss output for port ${HOST_PORT}..."
+            if command -v ss >/dev/null 2>&1; then
+              ss -ltnp | grep ${HOST_PORT} > ss-${HOST_PORT}.txt || true
+            else
+              netstat -ltnp 2>/dev/null | grep ${HOST_PORT} > netstat-${HOST_PORT}.txt || true
+            fi
+
+            echo "Probing HTTP endpoint on localhost:${HOST_PORT}..."
+            # try curl (if available) otherwise use wget
+            if command -v curl >/dev/null 2>&1; then
+              curl -sS --max-time 5 http://127.0.0.1:${HOST_PORT}/ || true > curl-${HOST_PORT}.txt
+            elif command -v wget >/dev/null 2>&1; then
+              wget -qO- --timeout=5 http://127.0.0.1:${HOST_PORT}/ || true > curl-${HOST_PORT}.txt
+            else
+              echo "curl/wget not available; skipping HTTP probe" > curl-${HOST_PORT}.txt
+            fi
+
+            ls -l docker-ps.txt ss-${HOST_PORT}.txt netstat-${HOST_PORT}.txt curl-${HOST_PORT}.txt || true
+          '''
+        }
+      }
+      post {
+        success {
+          archiveArtifacts artifacts: 'docker-ps.txt, ss-*.txt, netstat-*.txt, curl-*.txt', allowEmptyArchive: true
+          echo "Verification artifacts archived."
+        }
+        always {
+          // Print short summary to console
+          sh 'echo "Verification files (first 50 lines)"; for f in docker-ps.txt ss-*.txt netstat-*.txt curl-*.txt; do [ -f "$f" ] && echo \"--- $f ---\" && head -n 50 \"$f\" || true; done'
+        }
+      }
+    }
+  } // stages
 
   post {
-    success {
-      echo "Pipeline completed successfully. image: ${IMAGE_FULL}, container: ${CONTAINER_NAME} listening on ${HOST_PORT}."
-    }
     failure {
-      echo "Pipeline failed — please check the stage logs above."
+      echo "Build failed. Check above logs for Pre-check Docker and other errors."
+    }
+    always {
+      echo "Pipeline finished."
     }
   }
 }
